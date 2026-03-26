@@ -474,6 +474,204 @@ OpenShift supports four TLS profile types based on [Mozilla's Server Side TLS re
 
 **Note:** In Go, cipher suites are not configurable for TLS 1.3 - they are automatically selected by the runtime.
 
+### TLS Adherence Modes
+
+The new `tlsAdherence` field is a **sibling** to the existing `tlsSecurityProfile` field on the APIServer config object. It controls how strictly the TLS configuration is enforced by components:
+
+**Empty/Unset (default):** When the field is omitted or set to an empty string, the cluster defaults to `LegacyAdheringComponentsOnly` behavior. Components should treat an empty value the same as `LegacyAdheringComponentsOnly`.
+
+**`LegacyAdheringComponentsOnly`:** Maintains backward-compatible behavior. Components that already honor the cluster-wide TLS profile (such as kube-apiserver, openshift-apiserver, oauth-apiserver, and others) continue to do so. Components that do not already honor it continue to use their individual TLS configurations (e.g., `IngressController.spec.tlsSecurityProfile`, `KubeletConfig.spec.tlsSecurityProfile`, or component defaults). No additional components are required to start honoring the cluster-wide profile in this mode. See the "Components With Explicit Override Capability" section for details on component-specific TLS configuration options. This mode prevents breaking changes when upgrading clusters, allowing administrators to opt-in to expanded enforcement via `StrictAllComponents` when ready.
+
+**`StrictAllComponents`:** Enforces strict adherence to the TLS configuration. All components must honor the configured TLS profile unless they have a component-specific TLS configuration that overrides it (see "Override Precedence" below). If a core component fails to honor the TLS configuration when `StrictAllComponents` is set, this is treated as a **bug** requiring fixes and backporting. This mode is recommended for security-conscious deployments and is required for certain compliance frameworks.
+
+**Behavior Summary:**
+
+| Mode | API Servers (kube, openshift, oauth) | Other Components |
+|------|--------------------------------------|------------------|
+| `LegacyAdheringComponentsOnly` | Honor cluster-wide TLS profile | Maintain existing behavior (some already honor cluster-wide profile; others use their individual TLS configurations) |
+| `StrictAllComponents` | Honor cluster-wide TLS profile | Honor cluster-wide TLS profile (unless component-specific override exists) |
+
+**Unknown Enum Handling:** If a component encounters an unknown value for `tlsAdherence`, it should treat it as `StrictAllComponents` and log a warning. This ensures forward compatibility while defaulting to the more secure behavior.
+
+**Implementation Note:** Component implementors should use the `ShouldHonorClusterTLSProfile` helper function from library-go rather than checking the `tlsAdherence` field values directly. This helper encapsulates the logic for handling empty values and future enum additions.
+
+### Implement tlsAdherence
+
+The tlsAdherence field controls how strictly components in the cluster adhere to the TLS security profile configured on the APIServer resource.
+
+Valid values:
+
+- Legacy (default): Backward-compatible behavior where components attempt to honor the configured TLS profile but may fall back to their individual defaults if conflicts arise. This mode is intended for clusters that need to maintain compatibility with existing configurations during migration.
+- Strict: Enforces strict adherence to the TLS configuration. All components must honor the configured profile. This mode is recommended for security-conscious deployments and is required for certain compliance frameworks.
+
+#### API Extensions for tlsAdherence
+
+This enhancement extends the existing `apiserver.config.openshift.io/v1` resource with a new `tlsAdherence` field as a sibling to the existing `tlsSecurityProfile`.
+
+**Type Definitions:**
+
+```go
+// TLSAdherencePolicy defines which components adhere to the TLS security profile.
+// Implementors should use the ShouldHonorClusterTLSProfile helper function from library-go
+// rather than checking these values directly.
+// +kubebuilder:validation:Enum=LegacyAdheringComponentsOnly;StrictAllComponents
+type TLSAdherencePolicy string
+
+// In APIServerSpec:
+// tlsAdherence controls which components honor the configured TLS security profile.
+// +optional
+TLSAdherence TLSAdherencePolicy `json:"tlsAdherence,omitempty"`
+```
+
+**Field Behavior:**
+
+- **Optional:** The `tlsAdherence` field is optional (`+optional`, `omitempty`). This is required for upgrade compatibility—existing clusters upgrading to a version with this field will not have it set.
+- **Omission Semantics:** When the field is omitted (empty string `""`), components treat it the same as `LegacyAdheringComponentsOnly`. This "no opinion" approach preserves existing behavior on upgrade.
+
+**Example Configuration:**
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: APIServer
+metadata:
+  name: cluster
+spec:
+  tlsSecurityProfile:
+    type: Modern  # One of: Old, Intermediate, Modern, Custom
+    # If type is Custom:
+    custom:
+      ciphers:
+        - ECDHE-RSA-AES128-GCM-SHA256
+        - ECDHE-RSA-AES256-GCM-SHA384
+      minTLSVersion: VersionTLS12  # Custom ciphers only valid with TLS 1.2
+  # New field introduced by this enhancement (sibling to tlsSecurityProfile)
+  # Valid values: LegacyAdheringComponentsOnly, StrictAllComponents
+  # When omitted or empty, defaults to LegacyAdheringComponentsOnly behavior
+  tlsAdherence: StrictAllComponents
+```
+
+**Note:** The APIServer config currently lacks a status field. Future work may add a status field for components to report observed configuration and flag non-compliance.
+
+#### TLS 1.3 Example
+
+When using TLS 1.3, cipher configuration is not applicable:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: APIServer
+metadata:
+  name: cluster
+spec:
+  tlsSecurityProfile:
+    type: Modern
+    # Modern profile sets minTLSVersion: VersionTLS13
+    # Cipher suites are automatically set by Go runtime:
+    # - TLS_AES_128_GCM_SHA256
+    # - TLS_AES_256_GCM_SHA384
+    # - TLS_CHACHA20_POLY1305_SHA256
+  tlsAdherence: StrictAllComponents
+```
+
+#### Custom Profile with TLS 1.2 Example
+
+Custom cipher configuration is only supported with TLS 1.2:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: APIServer
+metadata:
+  name: cluster
+spec:
+  tlsSecurityProfile:
+    type: Custom
+    custom:
+      ciphers:
+        - ECDHE-RSA-AES128-GCM-SHA256
+        - ECDHE-RSA-AES256-GCM-SHA384
+        - ECDHE-ECDSA-AES128-GCM-SHA256
+        - ECDHE-ECDSA-AES256-GCM-SHA384
+      minTLSVersion: VersionTLS12
+  tlsAdherence: StrictAllComponents
+```
+
+#### Invalid Configuration (Rejected)
+
+The following configuration will be **rejected by validation**:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: APIServer
+metadata:
+  name: cluster
+spec:
+  tlsSecurityProfile:
+    type: Custom
+    custom:
+      ciphers:
+        - TLS_AES_128_GCM_SHA256
+      minTLSVersion: VersionTLS13  # ERROR: Cannot specify ciphers with TLS 1.3
+  tlsAdherence: StrictAllComponents
+# Validation Error: Cipher suites cannot be configured when minTLSVersion is VersionTLS13.
+# TLS 1.3 cipher suites are hardcoded by the Go runtime.
+```
+
+**Note on Existing Validation:** The APIServer already validates that cipher suites cannot be configured with TLS 1.3 via an [admission plugin in openshift-kube-apiserver](https://github.com/openshift/kubernetes/blob/9d521311f5fb67dc43f49eeb728ee2c80976835a/openshift-kube-apiserver/admission/customresourcevalidation/apiserver/validate_apiserver.go#L214-L219). This enhancement will add CEL validation expressions to match this existing behavior. The CEL validation will use ratcheting to ensure that existing resources with this configuration are not immediately invalidated upon upgrade.
+
+The API modifies existing behavior by:
+- Establishing the APIServer configuration as the default source for TLS configuration that all core components will consume
+- Introducing the `tlsAdherence` field to control enforcement behavior
+- Adding validation to reject cipher suite configuration with TLS 1.3
+- Documenting expected component behavior regarding TLS configuration inheritance
+
+#### Feature Gate
+
+The `tlsAdherence` field will be introduced behind a feature gate:
+
+- **Feature Gate Name:** `TLSAdherence`
+- **Initial State:** Tech Preview
+- **Promotion Path:** Promote to GA quickly once core components are confirmed to honor the field
+
+**Component Interaction with the Feature Gate:** The feature gate controls whether the `tlsAdherence` field is accepted by the API server — components themselves do not need to check the feature gate. Because the field is optional (`+optional`, `omitempty`), components only need to handle the field's value when unmarshaling the APIServer config:
+
+- Field not present (feature gate disabled, or field never set): unmarshals as `""` → treat as `LegacyAdheringComponentsOnly`
+- Field present but empty (`""`): treat as `LegacyAdheringComponentsOnly`
+- Field set to `LegacyAdheringComponentsOnly`: treat as `LegacyAdheringComponentsOnly`
+- Field set to `StrictAllComponents`: treat as `StrictAllComponents`
+- Field set to any other value: treat as `StrictAllComponents` and log a warning about the unknown enum value
+
+This means components do not need to set up feature gate watching or add feature-gate-specific code paths. The `ShouldHonorClusterTLSProfile` helper in library-go encapsulates all of this logic.
+
+#### Code Example
+
+Use the helper function ShouldHonorClusterTLSProfile() defined in
+https://github.com/openshift/library-go/blob/master/pkg/crypto/tls_adherence.go to implement tlsAdherence feature.
+
+```go
+package crypto
+
+import (
+	configv1 "github.com/openshift/api/config/v1"
+)
+
+// ShouldHonorClusterTLSProfile returns true if the component should honor the
+// cluster-wide TLS security profile settings from apiserver.config.openshift.io/cluster.
+//
+// When this returns true (StrictAllComponents mode), components must honor the
+// cluster-wide TLS profile unless they have a component-specific TLS configuration
+// that overrides it.
+//
+// Unknown enum values are treated as StrictAllComponents for forward compatibility
+// and to default to the more secure behavior.
+func ShouldHonorClusterTLSProfile(tlsAdherence configv1.TLSAdherencePolicy) bool {
+	switch tlsAdherence {
+	case configv1.TLSAdherencePolicyNoOpinion, configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly:
+		return false
+	default:
+		return true
+	}
+}
+```
+
 ## APIServer Custom Resource
 
 The TLS profile is configured in the `APIServer` custom resource named `cluster`. If `spec.tlsSecurityProfile` is not specified, the **Intermediate** profile is used by default.
